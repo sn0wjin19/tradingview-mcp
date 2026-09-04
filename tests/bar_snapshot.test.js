@@ -8,7 +8,9 @@ import {
   buildBarSnapshotExpression,
   getBarSnapshot,
   parseBarSnapshotOptions,
+  parsePaneScanOptions,
   scanPanes,
+  validatePaneScanResult,
 } from '../src/core/bar_snapshot.js';
 import { registerDataTools } from '../src/tools/data.js';
 import {
@@ -518,6 +520,97 @@ describe('data_scan_panes', () => {
     assert.ok(result.panes.every(pane => pane.records[0].studies[0].manifest));
   });
 
+  it('returns each exact cursor proof and the following closed prefix atomically', async () => {
+    const result = await scanPanes({
+      after_time_by_pane: [90, 90, 90],
+      count: 20,
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{}, {}, {}])),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(result.panes.map(pane => pane.records.map(record => record.bar_time)), [
+      [90, 100], [90, 100], [90, 100],
+    ]);
+    assert.ok(result.panes.every(pane => pane.cursor_time === 90));
+    assert.ok(result.panes.every(pane => pane.has_more === false));
+  });
+
+  it('marks a bounded forward prefix when newer closed bars remain', async () => {
+    const bars = [...BARS, [120, 4, 5, 3.5, 4.5, 13]];
+    const result = await scanPanes({
+      after_time_by_pane: [90, 90, 90],
+      count: 1,
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{ bars }, { bars }, { bars }])),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.ok(result.panes.every(pane => pane.has_more === true));
+    assert.deepEqual(result.panes[0].records.map(record => record.bar_time), [90, 100]);
+
+    const malformed = structuredClone(result);
+    malformed.panes[0].records.pop();
+    const validated = validatePaneScanResult(malformed, parsePaneScanOptions({
+      after_time_by_pane: [90, 90, 90],
+      count: 1,
+      study_filters: ['趋势过滤器'],
+    }));
+    assert.equal(validated.success, false);
+    assert.equal(validated.failure.code, 'invalid_response');
+  });
+
+  it('returns only the proof when a pane cursor is already caught up', async () => {
+    const result = await scanPanes({
+      after_time_by_pane: [100, 100, 100],
+      count: 20,
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{}, {}, {}])),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.ok(result.panes.every(pane => pane.has_more === false));
+    assert.deepEqual(result.panes[0].records.map(record => record.bar_time), [100]);
+  });
+
+  it('fails the whole scan when any pane cursor is not exactly loaded', async () => {
+    const result = await scanPanes({
+      after_time_by_pane: [90, 95, 90],
+      count: 1,
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{}, {}, {}])),
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.equal(result.failure.code, 'cursor_not_loaded');
+    assert.equal(result.failure.pane_index, 1);
+  });
+
+  it('fails the whole scan when cursor count differs from pane count', async () => {
+    const result = await scanPanes({
+      after_time_by_pane: [90],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{}, {}, {}])),
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.equal(result.failure.code, 'invalid_cursor_count');
+  });
+
+  it('normalizes millisecond pane cursors and requires closed-only mode', async () => {
+    const parsed = parsePaneScanOptions({
+      after_time_by_pane: [1_788_480_000_000],
+    });
+    assert.deepEqual(parsed.after_time_by_pane, [1_788_480_000]);
+    assert.throws(() => parsePaneScanOptions({ after_time_by_pane: [null] }), /finite unix timestamp/);
+    assert.throws(
+      () => parsePaneScanOptions({ after_time_by_pane: [1_788_480_000_001] }),
+      /whole-second/,
+    );
+    await assert.rejects(
+      scanPanes({ after_time_by_pane: [90], closed_only: false }),
+      /closed_only=true/,
+    );
+  });
+
   it('fails the whole scan with pane_index when a pane is missing a requested study', async () => {
     const result = await scanPanes({
       study_filters: ['趋势过滤器'],
@@ -593,8 +686,10 @@ describe('data_scan_panes', () => {
     const scan = tools.find(tool => tool.name === 'data_scan_panes');
     assert.ok(scan);
     assert.deepEqual(Object.keys(scan.schema).sort(), [
-      'closed_only', 'count', 'poll_interval_ms', 'stable_polls', 'study_filters',
+      'after_time_by_pane', 'closed_only', 'count', 'poll_interval_ms', 'stable_polls', 'study_filters',
     ]);
+    assert.equal(scan.schema.after_time_by_pane.safeParse([90]).success, true);
+    assert.equal(scan.schema.after_time_by_pane.safeParse([]).success, false);
     assert.equal(scan.schema.count.safeParse(1).success, true);
     assert.equal(scan.schema.count.safeParse(20).success, true);
     assert.equal(scan.schema.count.safeParse(21).success, false);

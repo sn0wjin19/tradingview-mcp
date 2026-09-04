@@ -51,6 +51,24 @@ function asStudyFilters(value) {
   return value.map(item => item.trim());
 }
 
+function asPaneCursorTimes(value) {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 16) {
+    throw new Error('after_time_by_pane must contain 1 to 16 unix timestamps');
+  }
+  return value.map((item, index) => {
+    if (item === null || typeof item === 'boolean' || (typeof item === 'string' && item.trim() === '')) {
+      throw new Error(`after_time_by_pane[${index}] must be a finite unix timestamp`);
+    }
+    const parsed = asOptionalTime(item, `after_time_by_pane[${index}]`);
+    const normalized = Math.abs(parsed) > 100000000000 ? parsed / 1000 : parsed;
+    if (!Number.isInteger(normalized)) {
+      throw new Error(`after_time_by_pane[${index}] must resolve to a whole-second unix timestamp`);
+    }
+    return normalized;
+  });
+}
+
 export function parseBarSnapshotOptions({
   time,
   bars_ago,
@@ -86,6 +104,7 @@ export function parseBarSnapshotOptions({
 }
 
 export function parsePaneScanOptions({
+  after_time_by_pane,
   count,
   closed_only,
   study_filters,
@@ -93,11 +112,17 @@ export function parsePaneScanOptions({
   poll_interval_ms,
 } = {}) {
   const stablePolls = asInteger(stable_polls, DEFAULT_STABLE_POLLS, 2, 12, 'stable_polls');
+  const closedOnly = asBoolean(closed_only, true, 'closed_only');
+  const afterTimes = asPaneCursorTimes(after_time_by_pane);
+  if (afterTimes !== null && !closedOnly) {
+    throw new Error('forward pane scans require closed_only=true');
+  }
   return {
     time: null,
     bars_ago: null,
+    after_time_by_pane: afterTimes,
     count: asInteger(count, DEFAULT_COUNT, 1, MAX_BAR_SNAPSHOT_COUNT, 'count'),
-    closed_only: asBoolean(closed_only, true, 'closed_only'),
+    closed_only: closedOnly,
     study_filters: asStudyFilters(study_filters),
     stable_polls: stablePolls,
     poll_interval_ms: asInteger(
@@ -130,6 +155,7 @@ export function buildBarSnapshotExpression(options) {
     pollIntervalMs: options.poll_interval_ms,
     pollAttempts: options.poll_attempts,
     scanPanes: options.scan_panes === true,
+    afterTimes: options.after_time_by_pane || null,
   });
   return `
     (async function() {
@@ -367,7 +393,7 @@ export function buildBarSnapshotExpression(options) {
         for (var i = 0; i < row.length; i += 1) copy.push(row[i] === undefined ? null : row[i]);
         return copy;
       }
-      function locateBars(bars) {
+      function locateBars(bars, paneIndex) {
         if (!bars || typeof bars.lastIndex !== 'function' || typeof bars.firstIndex !== 'function'
             || typeof bars.valueAt !== 'function' || typeof bars.searchByTime !== 'function') {
           return { error: fail('main_series_unavailable', 'Main series bars are unavailable') };
@@ -383,7 +409,25 @@ export function buildBarSnapshotExpression(options) {
           return { error: fail('active_bar_unavailable', 'Active bar time is unavailable') };
         }
         var endIndex;
-        if (opt.time != null) {
+        var cursorTime = null;
+        var hasMore = false;
+        var cursorStartIndex = null;
+        if (opt.afterTimes != null) {
+          cursorTime = comparableTime(opt.afterTimes[paneIndex]);
+          var cursor = bars.searchByTime(cursorTime);
+          if (!cursor || !cursor.value || !sameTime(cursor.value[0], cursorTime)
+              || !Number.isInteger(cursor.index)) {
+            return { error: fail('cursor_not_loaded', 'Pane watermark is not loaded on the main series', {
+              cursor_time: opt.afterTimes[paneIndex]
+            }) };
+          }
+          if (cursor.index >= last) {
+            return { error: fail('active_bar_excluded', 'Pane watermark must be a closed bar') };
+          }
+          endIndex = Math.min(cursor.index + opt.count, last - 1);
+          hasMore = endIndex < last - 1;
+          cursorStartIndex = cursor.index;
+        } else if (opt.time != null) {
           var wanted = comparableTime(opt.time);
           var found = bars.searchByTime(wanted);
           if (!found || !found.value || !sameTime(found.value[0], wanted) || !Number.isInteger(found.index)) {
@@ -401,7 +445,7 @@ export function buildBarSnapshotExpression(options) {
         if (opt.closedOnly && endIndex >= last) {
           return { error: fail('active_bar_excluded', 'closed_only snapshots cannot return the active bar') };
         }
-        var startIndex = endIndex - opt.count + 1;
+        var startIndex = opt.afterTimes != null ? cursorStartIndex : endIndex - opt.count + 1;
         if (startIndex < first) {
           return { error: fail('insufficient_bars', 'The loaded main series has fewer bars than requested', {
             requested: opt.count,
@@ -430,7 +474,12 @@ export function buildBarSnapshotExpression(options) {
         if (records.length === 0) {
           return { error: fail('bar_not_found', 'No bars matched the snapshot request') };
         }
-        return { activeTime: activeTime, records: records };
+        return {
+          activeTime: activeTime,
+          records: records,
+          cursorTime: cursorTime,
+          hasMore: hasMore
+        };
       }
       function readStudies(chart, sources, records) {
         if (!Array.isArray(sources)) {
@@ -530,6 +579,8 @@ export function buildBarSnapshotExpression(options) {
           symbol: snapshot.symbol,
           timeframe: snapshot.timeframe,
           active_bar_time: snapshot.active_bar_time,
+          cursor_time: snapshot.cursor_time,
+          has_more: snapshot.has_more,
           records: snapshot.records.map(function(record) {
             return {
               bar_time: record.bar_time,
@@ -557,7 +608,7 @@ export function buildBarSnapshotExpression(options) {
         if (!identity) return fail('identity_unavailable', 'Chart symbol/timeframe identity is unavailable', {
           pane_index: paneIndex
         });
-        var located = locateBars(mainSeriesBars(chart));
+        var located = locateBars(mainSeriesBars(chart), paneIndex);
         if (located.error) {
           if (located.error.failure && paneIndex != null) located.error.failure.pane_index = paneIndex;
           return located.error;
@@ -577,7 +628,7 @@ export function buildBarSnapshotExpression(options) {
             studies: studies.studiesByBar[i]
           });
         }
-        return {
+        var result = {
           success: true,
           capture_mode: 'plot_list',
           pane_index: paneIndex,
@@ -586,6 +637,11 @@ export function buildBarSnapshotExpression(options) {
           active_bar_time: located.activeTime,
           records: records
         };
+        if (opt.afterTimes != null) {
+          result.cursor_time = located.cursorTime;
+          result.has_more = located.hasMore;
+        }
+        return result;
       }
 
       var previousChartOrder = null;
@@ -605,6 +661,12 @@ export function buildBarSnapshotExpression(options) {
                 current_pane_count: Array.isArray(charts) ? charts.length : null
               })
             : fail('layout_unavailable', 'Current layout has no readable panes');
+        }
+        if (opt.afterTimes != null && opt.afterTimes.length !== charts.length) {
+          return fail('invalid_cursor_count', 'after_time_by_pane must match the current pane count', {
+            expected: charts.length,
+            received: opt.afterTimes.length
+          });
         }
         if (previousChartOrder) {
           if (previousChartOrder.length !== charts.length) {
@@ -795,11 +857,24 @@ export function validateBarSnapshotResult(raw, options) {
   if (!Array.isArray(raw.records) || raw.records.length === 0) {
     return failClosed('bar_not_found', 'complete response has no records');
   }
-  if (raw.records.length !== options.count) {
+  const forwardPane = Array.isArray(options.after_time_by_pane) && Number.isInteger(raw.pane_index);
+  if (!forwardPane && raw.records.length !== options.count) {
     return failClosed('insufficient_bars', 'complete response did not return the requested bar count', {
       requested: options.count,
       returned: raw.records.length,
     });
+  }
+  if (forwardPane) {
+    const cursorTime = Number(options.after_time_by_pane[raw.pane_index]);
+    if (raw.records.length < 1 || raw.records.length > options.count + 1
+        || Number(raw.cursor_time) !== cursorTime
+        || Number(raw.records[0]?.bar_time) !== cursorTime
+        || typeof raw.has_more !== 'boolean') {
+      return failClosed('invalid_response', 'forward pane response has an invalid cursor window');
+    }
+    if (raw.has_more && raw.records.length !== options.count + 1) {
+      return failClosed('invalid_response', 'forward pane with has_more=true did not return a full page');
+    }
   }
   for (let index = 0; index < raw.records.length; index += 1) {
     const record = raw.records[index];

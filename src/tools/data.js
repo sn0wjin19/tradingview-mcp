@@ -77,14 +77,16 @@ export function registerDataTools(server) {
   });
 
   server.tool('data_scan_panes', 'Atomically read closed-bar PlotList snapshots from every pane in the current layout. The whole layout must remain complete, ordered, identity-stable, and identical for consecutive polls.', {
+    after_time_by_pane: z.array(z.coerce.number()).min(1).max(16).optional().describe('Forward cursor per pane. Each cursor must exactly match a loaded closed bar; returns the cursor proof plus up to count newer closed bars.'),
     count: z.coerce.number().int().min(1).max(MAX_BAR_SNAPSHOT_COUNT).optional().describe('Bars per pane, newest last (default 1, max 20).'),
     closed_only: z.boolean().optional().describe('Exclude each pane active bar (default true).'),
     study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for study names. Every pane must contain every requested visible PlotList study.'),
     stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Identical complete whole-layout snapshots required before success (default 2).'),
     poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between whole-layout observations (default 100).'),
-  }, async ({ count, closed_only, study_filters, stable_polls, poll_interval_ms }) => {
+  }, async ({ after_time_by_pane, count, closed_only, study_filters, stable_polls, poll_interval_ms }) => {
     try {
       const result = await scanPanes({
+        after_time_by_pane,
         count,
         closed_only,
         study_filters,
