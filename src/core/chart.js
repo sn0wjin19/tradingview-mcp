@@ -196,7 +196,8 @@ export async function scrollToDate({ date }) {
   return { success: true, date, centered_on: timestamp, resolution, window: { from, to } };
 }
 
-export async function symbolInfo() {
+export async function symbolInfo({ _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
   const result = await evaluate(`
     (function() {
       var chart = ${CHART_API};
@@ -204,7 +205,9 @@ export async function symbolInfo() {
       return {
         symbol: info.symbol, full_name: info.full_name, exchange: info.exchange,
         description: info.description, type: info.type, pro_name: info.pro_name,
-        typespecs: info.typespecs, resolution: chart.resolution(), chart_type: chart.chartType()
+        typespecs: info.typespecs, session: info.session, timezone: info.timezone,
+        session_holidays: info.session_holidays, corrections: info.corrections,
+        resolution: chart.resolution(), chart_type: chart.chartType()
       };
     })()
   `);

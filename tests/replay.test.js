@@ -18,8 +18,10 @@ import { start, step, autoplay, stop, trade, status, VALID_AUTOPLAY_DELAYS } fro
 function mockEvaluate(responses = {}, sequence) {
   let callIdx = 0;
   const calls = [];
-  const fn = async (expr) => {
+  const options = [];
+  const fn = async (expr, opts) => {
     calls.push(expr);
+    options.push(opts);
     if (sequence && callIdx < sequence.length) return sequence[callIdx++];
     for (const [key, val] of Object.entries(responses)) {
       if (expr.includes(key)) return typeof val === 'function' ? val(callIdx++) : val;
@@ -27,6 +29,7 @@ function mockEvaluate(responses = {}, sequence) {
     return undefined;
   };
   fn.calls = calls;
+  fn.options = options;
   return fn;
 }
 
@@ -35,14 +38,31 @@ function mockGetReplayApi() {
 }
 
 function mockDeps(responses = {}, sequence) {
-  const evaluate = mockEvaluate(responses, sequence);
-  return { _deps: { evaluate, getReplayApi: mockGetReplayApi() }, evaluate };
+  const evaluate = mockEvaluate({ 'isReadyToPlay': true, ...responses }, sequence);
+  return {
+    _deps: {
+      evaluate,
+      evaluateAsync: evaluate,
+      getReplayApi: mockGetReplayApi(),
+      wait: async () => {},
+      log: () => {},
+    },
+    evaluate,
+  };
+}
+
+function virtualClock() {
+  let currentMs = 0;
+  return {
+    now: () => currentMs,
+    wait: async ms => { currentMs += ms; },
+  };
 }
 
 // ── start() ──────────────────────────────────────────────────────────────
 
 describe('start() — date selection and polling', () => {
-  it('awaits selectDate with timestamp in ms for date param', async () => {
+  it('sends selectDate with timestamp in ms only after readiness', async () => {
     const { _deps, evaluate } = mockDeps({
       'isReplayAvailable': true,
       'showReplayToolbar': undefined,
@@ -55,11 +75,13 @@ describe('start() — date selection and polling', () => {
     assert.equal(result.replay_started, true);
     assert.equal(result.current_date, 1773532799);
     assert.equal(result.date, '2026-03-15');
-    // Verify selectDate was called with timestamp and .then()
-    const selectCall = evaluate.calls.find(c => c.includes('selectDate'));
+    // The selection Promise is not awaited through CDP; start confirmation is
+    // instead the bounded isReplayStarted + currentDate handshake.
+    const selectCallIndex = evaluate.calls.findIndex(c => c.includes('selectDate'));
+    const selectCall = evaluate.calls[selectCallIndex];
     assert.ok(selectCall, 'selectDate was called');
-    assert.ok(selectCall.includes('.then('), 'promise is awaited via .then()');
     assert.ok(selectCall.includes('1773532800000') || selectCall.includes('177'), 'passes ms timestamp');
+    assert.equal(evaluate.options[selectCallIndex]?.awaitPromise, undefined, 'selectDate does not create an unbounded CDP await');
   });
 
   it('calls selectFirstAvailableDate when no date given', async () => {
@@ -72,8 +94,69 @@ describe('start() — date selection and polling', () => {
     });
     const result = await start({ _deps });
     assert.equal(result.date, '(first available)');
-    const firstAvail = evaluate.calls.find(c => c.includes('selectFirstAvailableDate'));
+    const firstAvailIndex = evaluate.calls.findIndex(c => c.includes('selectFirstAvailableDate'));
+    const firstAvail = evaluate.calls[firstAvailIndex];
     assert.ok(firstAvail, 'selectFirstAvailableDate was called');
+    assert.equal(evaluate.options[firstAvailIndex]?.awaitPromise, undefined, 'selectFirstAvailableDate does not create an unbounded CDP await');
+  });
+
+  it('waits for ReadyToPlay before sending selectDate and logs each completed stage', async () => {
+    let readyChecks = 0;
+    const calls = [];
+    const stages = [];
+    const { now, wait } = virtualClock();
+    const evaluate = async expr => {
+      calls.push(expr);
+      if (expr.includes('isReplayAvailable')) return true;
+      if (expr.includes('showReplayToolbar')) return undefined;
+      if (expr.includes('isReadyToPlay')) return ++readyChecks >= 3;
+      if (expr.includes('selectDate')) return { promise: true };
+      if (expr.includes('isReplayStarted')) return true;
+      if (expr.includes('currentDate')) return 1773532800;
+      return undefined;
+    };
+
+    const result = await start({
+      date: '2026-03-15',
+      _deps: { evaluate, getReplayApi: mockGetReplayApi(), now, wait, log: (stage, details) => stages.push({ stage, ...details }) },
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(readyChecks, 3);
+    const selectCallIndex = calls.findIndex(call => call.includes('selectDate'));
+    const lastReadyCheckIndex = calls.map((call, index) => ({ call, index }))
+      .filter(({ call }) => call.includes('isReadyToPlay'))
+      .at(-1).index;
+    assert.ok(selectCallIndex > lastReadyCheckIndex, 'selectDate follows the ReadyToPlay check');
+    assert.ok(stages.some(entry => entry.stage === 'readiness' && entry.status === 'ready'));
+    assert.ok(stages.some(entry => entry.stage === 'selection' && entry.status === 'sent'));
+    assert.ok(stages.some(entry => entry.stage === 'started' && entry.status === 'ready'));
+  });
+
+  it('times out ReadyToPlay without sending selectDate and cleans up publicly', async () => {
+    let stopCalled = false;
+    const calls = [];
+    const stages = [];
+    const { now, wait } = virtualClock();
+    const evaluate = async expr => {
+      calls.push(expr);
+      if (expr.includes('isReplayAvailable')) return true;
+      if (expr.includes('showReplayToolbar')) return undefined;
+      if (expr.includes('isReadyToPlay')) return false;
+      if (expr.includes('stopReplay')) { stopCalled = true; return undefined; }
+      return undefined;
+    };
+
+    await assert.rejects(
+      () => start({
+        date: '2026-03-15',
+        _deps: { evaluate, getReplayApi: mockGetReplayApi(), now, wait, log: (stage, details) => stages.push({ stage, ...details }) },
+      }),
+      /timed out waiting for Replay UI readiness/,
+    );
+    assert.equal(calls.some(call => call.includes('selectDate')), false, 'no selection is sent before ReadyToPlay');
+    assert.equal(stopCalled, true, 'public stopReplay cleans up the unready toolbar mode');
+    assert.ok(stages.some(entry => entry.stage === 'failure' && entry.reason === 'ready_to_play_timeout'));
   });
 
   it('throws on invalid date string', async () => {
@@ -101,6 +184,7 @@ describe('start() — date selection and polling', () => {
     const evaluate = async (expr) => {
       if (expr.includes('isReplayAvailable')) return true;
       if (expr.includes('showReplayToolbar') || expr.includes('selectDate')) return 'ok';
+      if (expr.includes('isReadyToPlay')) return true;
       if (expr.includes('isReplayStarted')) {
         pollCount++;
         return pollCount >= 3; // becomes true on 3rd poll
@@ -111,7 +195,8 @@ describe('start() — date selection and polling', () => {
       return undefined;
     };
     evaluate.calls = [];
-    const result = await start({ date: '2026-01-01', _deps: { evaluate, getReplayApi: mockGetReplayApi() } });
+    const { now, wait } = virtualClock();
+    const result = await start({ date: '2026-01-01', _deps: { evaluate, getReplayApi: mockGetReplayApi(), now, wait, log: () => {} } });
     assert.equal(result.success, true);
     assert.equal(result.current_date, 1700000000);
     assert.ok(pollCount >= 4, 'polled multiple times');
@@ -122,18 +207,39 @@ describe('start() — date selection and polling', () => {
     const evaluate = async (expr) => {
       if (expr.includes('isReplayAvailable')) return true;
       if (expr.includes('showReplayToolbar') || expr.includes('selectDate')) return 'ok';
+      if (expr.includes('isReadyToPlay')) return true;
       if (expr.includes('isReplayStarted')) return false; // never starts
       if (expr.includes('currentDate')) return null;
       if (expr.includes('stopReplay')) { stopCalled = true; return undefined; }
       return undefined;
     };
     evaluate.calls = [];
+    const { now, wait } = virtualClock();
     await assert.rejects(
-      () => start({ date: '2026-01-01', _deps: { evaluate, getReplayApi: mockGetReplayApi() } }),
+      () => start({ date: '2026-01-01', _deps: { evaluate, getReplayApi: mockGetReplayApi(), now, wait, log: () => {} } }),
       (err) => {
         assert.ok(err.message.includes('Replay failed to start'));
         return true;
       },
+    );
+    assert.ok(stopCalled, 'stopReplay called for cleanup');
+  });
+
+  it('throws and stops replay when currentDate never becomes available', async () => {
+    let stopCalled = false;
+    const evaluate = async (expr) => {
+      if (expr.includes('isReplayAvailable')) return true;
+      if (expr.includes('showReplayToolbar') || expr.includes('selectDate')) return 'ok';
+      if (expr.includes('isReadyToPlay')) return true;
+      if (expr.includes('isReplayStarted')) return true;
+      if (expr.includes('currentDate')) return null;
+      if (expr.includes('stopReplay')) { stopCalled = true; return undefined; }
+      return undefined;
+    };
+    const { now, wait } = virtualClock();
+    await assert.rejects(
+      () => start({ date: '2026-01-01', _deps: { evaluate, getReplayApi: mockGetReplayApi(), now, wait, log: () => {} } }),
+      (err) => err.message.includes('Replay start timed out') && err.message.includes('currentDate'),
     );
     assert.ok(stopCalled, 'stopReplay called for cleanup');
   });
@@ -258,14 +364,20 @@ describe('autoplay() — delay validation', () => {
 
 describe('stop()', () => {
   it('calls stopReplay when started', async () => {
-    const { _deps, evaluate } = mockDeps({
-      'isReplayStarted': true,
-      'stopReplay': undefined,
+    let replayStarted = true;
+    const evaluate = mockEvaluate({
+      'isReplayStarted': () => replayStarted,
     });
-    const result = await stop({ _deps });
+    const asyncCalls = [];
+    const evaluateAsync = async expr => {
+      asyncCalls.push(expr);
+      if (expr.includes('stopReplay')) replayStarted = false;
+      return undefined;
+    };
+    const result = await stop({ _deps: { evaluate, evaluateAsync, getReplayApi: mockGetReplayApi() } });
     assert.equal(result.success, true);
     assert.equal(result.action, 'replay_stopped');
-    const stopCall = evaluate.calls.find(c => c.includes('stopReplay'));
+    const stopCall = asyncCalls.find(c => c.includes('stopReplay'));
     assert.ok(stopCall, 'stopReplay was called');
   });
 

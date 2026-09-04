@@ -1,8 +1,81 @@
 import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
+import * as live0822 from '../core/live_capture_0822.js';
+import { getBarSnapshot, MAX_BAR_SNAPSHOT_COUNT } from '../core/bar_snapshot.js';
 
 export function registerDataTools(server) {
+  server.tool('data_capture_0822_closed', 'Atomically capture 1–5 confirmed 0822 closed bars from the live chart without entering or advancing Replay. The newest target is the bar immediately before the active bar and is the only row allowed to emit strategy-eligible checkpoint deltas; older tail rows are finalized PlotList features only and explicitly non-causal for events. The tool requires at least two identical full observations and returns symbol/timeframe from that same page evaluation.', {
+    count: z.coerce.number().int().min(1).max(5).optional().describe('Closed bars to capture, newest last (default 3). The active live bar is always excluded.'),
+    poll_attempts: z.coerce.number().int().min(2).max(80).optional().describe('Maximum atomic stability observations (default 16). Must be at least stable_polls.'),
+    poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between stability observations (default 125).'),
+    stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Identical complete snapshots required before capture (default 2).'),
+    settle_ms: z.coerce.number().int().min(0).max(10000).optional().describe('Read-only delay before polling, allowing a just-switched chart to repopulate PlotList sources.'),
+    known_label_keys: z.array(z.string()).max(live0822.MAX_LIVE_CHECKPOINT_KEYS).optional().describe('Persisted pl4 physical-epoch label checkpoint. Leave empty only for first live seed.'),
+    known_shape_keys: z.array(z.string()).max(live0822.MAX_LIVE_CHECKPOINT_KEYS).optional().describe('Persisted Trend PlotList shape checkpoint.'),
+    shape_state_initialized: z.boolean().optional().describe('Whether known_shape_keys is an initialized live checkpoint.'),
+    label_state_initialized: z.boolean().optional().describe('Whether known_label_keys is an initialized live checkpoint. A false first seed never turns labels already visible now into historical first-seen events.'),
+  }, async ({
+    count,
+    poll_attempts,
+    poll_interval_ms,
+    stable_polls,
+    settle_ms,
+    known_label_keys,
+    known_shape_keys,
+    shape_state_initialized,
+    label_state_initialized,
+  }) => {
+    try {
+      return jsonResult(await live0822.capture0822Closed({
+        count,
+        poll_attempts,
+        poll_interval_ms,
+        stable_polls,
+        settle_ms,
+        known_label_keys,
+        known_shape_keys,
+        shape_state_initialized,
+        label_state_initialized,
+      }));
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
+  });
+
+  server.tool('data_get_bar_snapshot', 'Atomically read a small closed-bar PlotList snapshot from the active pane without moving the mouse. time and bars_ago are mutually exclusive; omit both for the latest closed bar. Requires consecutive identical complete snapshots before success.', {
+    time: z.coerce.number().optional().describe('Unix bar time (seconds or milliseconds). Mutually exclusive with bars_ago.'),
+    bars_ago: z.coerce.number().int().min(0).max(5000).optional().describe('Offset from the last loaded bar. 1 is the latest closed bar when closed_only is true. Mutually exclusive with time.'),
+    count: z.coerce.number().int().min(1).max(MAX_BAR_SNAPSHOT_COUNT).optional().describe('Closed bars to return, newest last (default 1, max 20).'),
+    closed_only: z.boolean().optional().describe('Exclude the active bar (default true).'),
+    study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for study names. If set, every filter must match a visible PlotList study.'),
+    stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Identical complete snapshots required before success (default 2).'),
+    poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between stability observations (default 100).'),
+  }, async ({
+    time,
+    bars_ago,
+    count,
+    closed_only,
+    study_filters,
+    stable_polls,
+    poll_interval_ms,
+  }) => {
+    try {
+      const result = await getBarSnapshot({
+        time,
+        bars_ago,
+        count,
+        closed_only,
+        study_filters,
+        stable_polls,
+        poll_interval_ms,
+      });
+      return jsonResult(result, result.success !== true);
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
+  });
+
   server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),

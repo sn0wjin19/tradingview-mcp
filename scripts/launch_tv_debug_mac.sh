@@ -28,7 +28,9 @@ fi
 
 # Fallback: find any TradingView.app
 if [ -z "$APP" ] || [ ! -f "$APP" ]; then
-  APP=$(find /Applications "$HOME/Applications" -name "TradingView.app" -maxdepth 2 2>/dev/null | head -1)
+  # BSD find on macOS has no GNU -maxdepth option. Prune once the app bundle
+  # is found so this remains bounded without descending into its contents.
+  APP=$(find /Applications "$HOME/Applications" -type d -name "TradingView.app" -prune -print 2>/dev/null | head -1)
   if [ -n "$APP" ]; then
     APP="$APP/Contents/MacOS/TradingView"
   fi

@@ -3,7 +3,29 @@
  */
 import { getClient, getTargetInfo, evaluate } from '../connection.js';
 import { existsSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import { join } from 'path';
+import { execFileSync, execSync, spawn } from 'child_process';
+
+function findWindowsStoreTradingView() {
+  try {
+    const installLocation = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        '(Get-AppxPackage -Name TradingView.Desktop -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InstallLocation)',
+      ],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true },
+    ).trim();
+    if (!installLocation) return null;
+
+    const candidate = join(installLocation, 'TradingView.exe');
+    return existsSync(candidate) ? candidate : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function healthCheck() {
   await getClient();
@@ -195,6 +217,10 @@ export async function launch({ port, kill_existing } = {}) {
       tvPath = execSync(cmd, { timeout: 3000 }).toString().trim().split('\n')[0];
       if (tvPath && !existsSync(tvPath)) tvPath = null;
     } catch { /* ignore */ }
+  }
+
+  if (!tvPath && platform === 'win32') {
+    tvPath = findWindowsStoreTradingView();
   }
 
   if (!tvPath && platform === 'darwin') {
