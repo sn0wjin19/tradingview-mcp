@@ -2,7 +2,13 @@ import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 import * as live0822 from '../core/live_capture_0822.js';
-import { getBarSnapshot, MAX_BAR_SNAPSHOT_COUNT, scanPanes } from '../core/bar_snapshot.js';
+import {
+  getBarHistory,
+  getBarSnapshot,
+  MAX_BAR_SNAPSHOT_COUNT,
+  MAX_REPLAY_BAR_SNAPSHOT_COUNT,
+  scanPanes,
+} from '../core/bar_snapshot.js';
 
 export function registerDataTools(server) {
   server.tool('data_capture_0822_closed', 'Atomically capture 1–5 confirmed 0822 closed bars from the live chart without entering or advancing Replay. The newest target is the bar immediately before the active bar and is the only row allowed to emit strategy-eligible checkpoint deltas; older tail rows are finalized PlotList features only and explicitly non-causal for events. The tool requires at least two identical full observations and returns symbol/timeframe from that same page evaluation.', {
@@ -66,6 +72,27 @@ export function registerDataTools(server) {
         bars_ago,
         count,
         closed_only,
+        study_filters,
+        stable_polls,
+        poll_interval_ms,
+      });
+      return jsonResult(result, result.success !== true);
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
+  });
+
+  server.tool('data_get_bar_history', 'Read the current live 3000-bar indicator window without Replay or mouse scrolling. Study manifests are returned once and records contain positional plot/fill values.', {
+    bars_ago: z.coerce.number().int().min(1).max(5000).optional().describe('Offset from the active bar to the newest returned closed bar (default 1).'),
+    count: z.coerce.number().int().min(1).max(MAX_REPLAY_BAR_SNAPSHOT_COUNT).optional().describe(`Closed bars to return, newest last (default 1, max ${MAX_REPLAY_BAR_SNAPSHOT_COUNT}).`),
+    study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for visible PlotList studies. Every requested study must have every returned row.'),
+    stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Identical complete snapshots required before success (default 2).'),
+    poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between stability observations (default 100).'),
+  }, async ({ bars_ago, count, study_filters, stable_polls, poll_interval_ms }) => {
+    try {
+      const result = await getBarHistory({
+        bars_ago,
+        count,
         study_filters,
         stable_polls,
         poll_interval_ms,

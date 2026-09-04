@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/replay.js';
+import {
+  getReplayBarSnapshot,
+  MAX_REPLAY_BAR_SNAPSHOT_COUNT,
+} from '../core/bar_snapshot.js';
 
 export function registerReplayTools(server) {
   server.tool('replay_start', 'Start bar replay mode, optionally at a specific date', {
@@ -13,6 +17,27 @@ export function registerReplayTools(server) {
   server.tool('replay_step', 'Advance one bar in replay mode', {}, async () => {
     try { return jsonResult(await core.step()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('replay_get_bar_snapshot', 'Read a stable, closed compact PlotList window while Replay is active. The caller must first position Replay and step once so the desired target is closed. Study manifests are returned once and records contain positional plot/fill values. Missing history is requested through the chart model without mouse scrolling.', {
+    bars_ago: z.coerce.number().int().min(1).max(5000).optional().describe('Offset from the active Replay bar to the newest returned closed bar (default 1).'),
+    count: z.coerce.number().int().min(1).max(MAX_REPLAY_BAR_SNAPSHOT_COUNT).optional().describe(`Closed bars to return, newest last (default 1, max ${MAX_REPLAY_BAR_SNAPSHOT_COUNT}).`),
+    study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for visible PlotList studies. Every requested study must have every returned row.'),
+    stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Identical complete snapshots required before success (default 2).'),
+    poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between stability observations (default 100).'),
+  }, async ({ bars_ago, count, study_filters, stable_polls, poll_interval_ms }) => {
+    try {
+      const result = await getReplayBarSnapshot({
+        bars_ago,
+        count,
+        study_filters,
+        stable_polls,
+        poll_interval_ms,
+      });
+      return jsonResult(result, result.success !== true);
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
   });
 
   server.tool('replay_capture_chunk', 'Capture 1–25 replay bars with no autoplay. v4 records the post-step finalized target bar: it first proves the Replay clock and preview OHLCV are quiet enough for one manual step, then requires the matching postBars[-2] OHLCV and timestamped Trend/Swing PlotList rows to remain stable. Active Data Window values are preview diagnostics only and are never used as final features. Pine label checkpoints use strict pl4 physical-epoch identities, so replay-local primitive IDs and logical indices cannot suppress a later physical bar after Replay restarts. Returns strict 0822-replay.v4/post_target_final_label_epoch checkpoints.', {

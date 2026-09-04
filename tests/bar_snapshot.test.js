@@ -6,9 +6,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildBarSnapshotExpression,
+  getBarHistory,
   getBarSnapshot,
+  getReplayBarSnapshot,
   parseBarSnapshotOptions,
   parsePaneScanOptions,
+  parseReplayBarSnapshotOptions,
   scanPanes,
   validatePaneScanResult,
 } from '../src/core/bar_snapshot.js';
@@ -67,6 +70,7 @@ function makeRuntime({
   bars = BARS,
   studies,
   symbolSequence,
+  replayStarted = false,
 } = {}) {
   let symbolIndex = 0;
   const currentSymbol = () => {
@@ -105,7 +109,7 @@ function makeRuntime({
     },
     pageWindow: {
       TradingViewApi: {
-        _replayApi: { isReplayStarted: () => false },
+        _replayApi: { isReplayStarted: () => replayStarted },
         _activeChartWidgetWV: {
           value: () => ({
             symbol: () => currentSymbol(),
@@ -182,6 +186,58 @@ describe('data_get_bar_snapshot options', () => {
       /mutually exclusive/,
     );
     assert.equal(touched, false);
+  });
+});
+
+describe('replay_get_bar_snapshot', () => {
+  it('uses the same typed PlotList contract only while Replay is active', async () => {
+    const result = await getReplayBarSnapshot({
+      bars_ago: 1,
+      count: 2,
+      study_filters: ['0822'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makeRuntime({ replayStarted: true })),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(result.records.map(record => record.bar_time), [90, 100]);
+    assert.ok(result.records.every(record => record.closed === true));
+    assert.equal(result.capture_mode, 'plot_list.compact.v1');
+    assert.equal(result.study_definitions[0].manifest.plots[0].title, 'EMA21');
+    assert.equal(result.records[0].study_values[0].plots[0][0], 100);
+  });
+
+  it('fails closed outside Replay and bounds the larger page size', async () => {
+    assert.throws(
+      () => parseReplayBarSnapshotOptions({ count: 3001 }),
+      /count must be an integer from 1 to 3000/,
+    );
+    const result = await getReplayBarSnapshot({
+      _deps: depsFor(makeRuntime()),
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.equal(result.failure.code, 'replay_not_active');
+    assert.deepEqual(result.records, []);
+  });
+});
+
+describe('data_get_bar_history', () => {
+  it('uses the compact contract only outside Replay', async () => {
+    const result = await getBarHistory({
+      bars_ago: 1,
+      count: 2,
+      study_filters: ['0822'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makeRuntime()),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(result.capture_mode, 'plot_list.compact.v1');
+    assert.deepEqual(result.records.map(record => record.bar_time), [90, 100]);
+
+    const replayResult = await getBarHistory({
+      _deps: depsFor(makeRuntime({ replayStarted: true })),
+    });
+    assert.equal(replayResult.success, false, JSON.stringify(replayResult));
+    assert.equal(replayResult.failure.code, 'replay_active');
   });
 });
 
@@ -478,6 +534,7 @@ describe('data_get_bar_snapshot tool registration', () => {
     assert.ok(snapshot.schema.time);
     assert.ok(snapshot.schema.bars_ago);
     assert.ok(snapshot.schema.study_filters);
+    assert.ok(tools.find(tool => tool.name === 'data_get_bar_history'));
     assert.equal(tools.some(tool => tool.name === 'data_scan_panes'), true);
     assert.equal(tools.some(tool => tool.name === 'chart_hover_bar'), false);
   });

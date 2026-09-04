@@ -8,10 +8,15 @@
  * capture contracts.
  */
 import { evaluateAsync as _evaluateAsync } from '../connection.js';
-import { hydrateStudyFromPlotList } from './plot_list.js';
+import {
+  hydrateStudyFromPlotList,
+  mapPlotListRow,
+  parseFilledAreas,
+} from './plot_list.js';
 
 export const BAR_SNAPSHOT_CAPTURE_MODE = 'plot_list';
 export const MAX_BAR_SNAPSHOT_COUNT = 20;
+export const MAX_REPLAY_BAR_SNAPSHOT_COUNT = 3000;
 const DEFAULT_COUNT = 1;
 const DEFAULT_STABLE_POLLS = 2;
 const DEFAULT_POLL_INTERVAL_MS = 100;
@@ -134,6 +139,40 @@ export function parsePaneScanOptions({
   };
 }
 
+export function parseReplayBarSnapshotOptions({
+  bars_ago,
+  count,
+  study_filters,
+  stable_polls,
+  poll_interval_ms,
+} = {}) {
+  const stablePolls = asInteger(stable_polls, DEFAULT_STABLE_POLLS, 2, 12, 'stable_polls');
+  return {
+    time: null,
+    bars_ago: asInteger(bars_ago, 1, 1, 5000, 'bars_ago'),
+    after_time_by_pane: null,
+    count: asInteger(count, DEFAULT_COUNT, 1, MAX_REPLAY_BAR_SNAPSHOT_COUNT, 'count'),
+    closed_only: true,
+    study_filters: asStudyFilters(study_filters),
+    stable_polls: stablePolls,
+    poll_interval_ms: asInteger(
+      poll_interval_ms, DEFAULT_POLL_INTERVAL_MS, 25, 2000, 'poll_interval_ms'
+    ),
+    poll_attempts: Math.max(80, stablePolls),
+    scan_panes: false,
+    replay_policy: 'require',
+    load_history: true,
+    compact_replay: true,
+  };
+}
+
+export function parseBarHistoryOptions(options = {}) {
+  return {
+    ...parseReplayBarSnapshotOptions(options),
+    replay_policy: 'forbid',
+  };
+}
+
 function failClosed(code, message, extra = {}) {
   return {
     success: false,
@@ -157,6 +196,9 @@ export function buildBarSnapshotExpression(options) {
     pollAttempts: options.poll_attempts,
     scanPanes: options.scan_panes === true,
     afterTimes: options.after_time_by_pane || null,
+    replayPolicy: options.replay_policy || 'forbid',
+    loadHistory: options.load_history === true,
+    compactReplay: options.compact_replay === true,
   });
   return `
     (async function() {
@@ -562,21 +604,42 @@ export function buildBarSnapshotExpression(options) {
             }
             studies.push({
               entity_id: study.entity_id,
-              name: study.name,
-              history_calculation_may_change: !!(study.meta && study.meta.historyCalculationMayChange),
-              meta: study.meta,
+              ...(opt.compactReplay ? {} : {
+                name: study.name,
+                history_calculation_may_change: !!(study.meta && study.meta.historyCalculationMayChange),
+                meta: study.meta
+              }),
               row: cloneRow(row)
             });
           }
           studiesByBar.push(studies);
         }
-        return { studiesByBar: studiesByBar };
+        return {
+          studiesByBar: studiesByBar,
+          studyDefinitions: opt.compactReplay ? matched.map(function(study) {
+            return {
+              entity_id: study.entity_id,
+              name: study.name,
+              history_calculation_may_change: !!(study.meta && study.meta.historyCalculationMayChange),
+              meta: study.meta
+            };
+          }) : null
+        };
       }
       function fingerprint(snapshot) {
         if (snapshot && Array.isArray(snapshot.panes)) {
           return JSON.stringify(snapshot.panes.map(function(pane) {
             return JSON.parse(fingerprint(pane));
           }));
+        }
+        if (Array.isArray(snapshot.study_definitions)) {
+          return JSON.stringify({
+            symbol: snapshot.symbol,
+            timeframe: snapshot.timeframe,
+            active_bar_time: snapshot.active_bar_time,
+            study_definitions: snapshot.study_definitions,
+            records: snapshot.records
+          });
         }
         return JSON.stringify({
           symbol: snapshot.symbol,
@@ -601,6 +664,23 @@ export function buildBarSnapshotExpression(options) {
             };
           })
         });
+      }
+      function compactReplaySnapshot(snapshot) {
+        if (!Array.isArray(snapshot.study_definitions)) {
+          return fail('invalid_response', 'Compact snapshot has no study definitions');
+        }
+        return {
+          ...snapshot,
+          capture_mode: 'plot_list.compact.raw.v1',
+          records: snapshot.records.map(function(record) {
+            return {
+              bar_time: record.bar_time,
+              closed: record.closed,
+              ohlcv: record.ohlcv,
+              study_rows: record.studies
+            };
+          })
+        };
       }
       function observe(chart, paneIndex) {
         chart = chart || chartWidget();
@@ -640,11 +720,45 @@ export function buildBarSnapshotExpression(options) {
           active_bar_time: located.activeTime,
           records: records
         };
+        if (opt.compactReplay) result.study_definitions = studies.studyDefinitions;
         if (located.forwardPane) {
           result.cursor_time = located.cursorTime;
           result.has_more = located.hasMore;
         }
         return result;
+      }
+
+      if (opt.loadHistory) {
+        var initialReplayState = replayActive();
+        if (initialReplayState === null) {
+          return fail('replay_state_unavailable', 'Replay state is unavailable');
+        }
+        if (opt.replayPolicy === 'require' && initialReplayState !== true) {
+          return fail('replay_not_active', 'Replay PlotList snapshots require active Replay');
+        }
+        if (opt.replayPolicy !== 'require' && initialReplayState === true) {
+          return fail('replay_active', 'Live PlotList history is unavailable while Replay is active');
+        }
+        var historyChart = chartWidget();
+        var historyWidget = historyChart && (historyChart._chartWidget || historyChart);
+        var historyModel = historyWidget && typeof historyWidget.model === 'function'
+          ? historyWidget.model() : null;
+        var historySeries = historyModel && typeof historyModel.mainSeries === 'function'
+          ? historyModel.mainSeries() : null;
+        var historyBars = historySeries && typeof historySeries.bars === 'function'
+          ? historySeries.bars() : null;
+        if (!historyBars || typeof historyBars.firstIndex !== 'function'
+            || typeof historyBars.lastIndex !== 'function') {
+          return fail('history_request_unavailable', 'Chart history request API is unavailable');
+        }
+        var historyAvailable = historyBars.lastIndex() - historyBars.firstIndex() + 1;
+        var historyRequired = opt.barsAgo + opt.count;
+        if (historyAvailable < historyRequired) {
+          if (typeof historySeries.requestMoreData !== 'function') {
+            return fail('history_request_unavailable', 'Chart history request API is unavailable');
+          }
+          historySeries.requestMoreData(historyRequired - historyAvailable);
+        }
       }
 
       var previousChartOrder = null;
@@ -752,13 +866,18 @@ export function buildBarSnapshotExpression(options) {
         var replayStarted = replayActive();
         var snapshot = replayStarted === null
           ? fail('replay_state_unavailable', 'Replay state is unavailable')
-          : (replayStarted
-              ? fail('replay_active', 'Forward-only PlotList snapshots are unavailable while Replay is active')
-              : (opt.scanPanes ? observeLayout() : observe()));
+          : (opt.replayPolicy === 'require'
+              ? (replayStarted
+                  ? observe()
+                  : fail('replay_not_active', 'Replay PlotList snapshots require active Replay'))
+              : (replayStarted
+                  ? fail('replay_active', 'Forward-only PlotList snapshots are unavailable while Replay is active')
+                  : (opt.scanPanes ? observeLayout() : observe())));
         if (!snapshot || snapshot.success !== true) {
           if (snapshot && snapshot.failure && (
             snapshot.failure.code === 'active_bar_excluded'
             || snapshot.failure.code === 'replay_active'
+            || snapshot.failure.code === 'replay_not_active'
             || snapshot.failure.code === 'replay_state_unavailable'
           )) {
             return snapshot;
@@ -789,7 +908,7 @@ export function buildBarSnapshotExpression(options) {
                 lastComplete.panes[paneIndex].identity_verified = true;
               }
             }
-            return lastComplete;
+            return opt.compactReplay ? compactReplaySnapshot(lastComplete) : lastComplete;
           }
         }
         if (attempt < opt.pollAttempts - 1) await sleep(opt.pollIntervalMs);
@@ -922,6 +1041,93 @@ export async function getBarSnapshot(options = {}) {
   const { evaluateAsync } = resolve(options._deps);
   const raw = await evaluateAsync(buildBarSnapshotExpression(parsed));
   return hydrateBarSnapshot(validateBarSnapshotResult(raw, parsed));
+}
+
+export async function getReplayBarSnapshot(options = {}) {
+  const parsed = parseReplayBarSnapshotOptions(options);
+  const { evaluateAsync } = resolve(options._deps);
+  const raw = await evaluateAsync(buildBarSnapshotExpression(parsed));
+  if (!raw || raw.success !== true) return validateBarSnapshotResult(raw, parsed);
+  const expanded = expandCompactReplaySnapshot(raw);
+  const validated = validateBarSnapshotResult(expanded, parsed);
+  return compactValidatedReplaySnapshot(validated, raw);
+}
+
+export async function getBarHistory(options = {}) {
+  const parsed = parseBarHistoryOptions(options);
+  const { evaluateAsync } = resolve(options._deps);
+  const raw = await evaluateAsync(buildBarSnapshotExpression(parsed));
+  if (!raw || raw.success !== true) return validateBarSnapshotResult(raw, parsed);
+  const expanded = expandCompactReplaySnapshot(raw);
+  const validated = validateBarSnapshotResult(expanded, parsed);
+  return compactValidatedReplaySnapshot(validated, raw);
+}
+
+function expandCompactReplaySnapshot(raw) {
+  if (raw.capture_mode !== 'plot_list.compact.raw.v1'
+      || !Array.isArray(raw.study_definitions) || !Array.isArray(raw.records)) {
+    return raw;
+  }
+  return {
+    ...raw,
+    capture_mode: BAR_SNAPSHOT_CAPTURE_MODE,
+    records: raw.records.map(record => ({
+      bar_time: record.bar_time,
+      closed: record.closed,
+      ohlcv: record.ohlcv,
+      studies: Array.isArray(record.study_rows)
+        ? record.study_rows.map((studyRow, index) => ({
+            ...raw.study_definitions[index],
+            entity_id: studyRow && studyRow.entity_id,
+            row: studyRow && studyRow.row,
+          }))
+        : [],
+    })),
+  };
+}
+
+function compactColor(color) {
+  if (!color || typeof color !== 'object') return null;
+  return [color.hex ?? null, color.alpha ?? null];
+}
+
+function compactValidatedReplaySnapshot(snapshot, compactRaw) {
+  if (!snapshot || snapshot.success !== true || !Array.isArray(snapshot.records)) return snapshot;
+  if (!compactRaw || !Array.isArray(compactRaw.study_definitions)
+      || !Array.isArray(compactRaw.records)) return snapshot;
+  const definitions = compactRaw.study_definitions.map(definition => (
+    hydrateStudyFromPlotList({ ...definition, row: [] })
+  ));
+  return {
+    success: true,
+    capture_mode: 'plot_list.compact.v1',
+    identity_verified: snapshot.identity_verified === true,
+    stable_polls: snapshot.stable_polls,
+    symbol: snapshot.symbol,
+    timeframe: snapshot.timeframe,
+    active_bar_time: snapshot.active_bar_time,
+    study_definitions: definitions.map(study => ({
+      entity_id: study.entity_id,
+      name: study.name,
+      history_calculation_may_change: study.history_calculation_may_change,
+      manifest: study.manifest,
+    })),
+    records: compactRaw.records.map(record => ({
+      bar_time: record.bar_time,
+      closed: record.closed,
+      ohlcv: record.ohlcv,
+      study_values: record.study_rows.map((studyRow, index) => {
+        const definition = compactRaw.study_definitions[index];
+        const plots = mapPlotListRow(definition.meta, studyRow.row);
+        const fills = parseFilledAreas(definition.meta, studyRow.row, plots);
+        return {
+          entity_id: studyRow.entity_id,
+          plots: plots.map(plot => [plot.value, compactColor(plot.color)]),
+          fills: fills.map(fill => [fill.upper, fill.lower, compactColor(fill.color)]),
+        };
+      }),
+    })),
+  };
 }
 
 export function hydratePaneScan(raw) {
