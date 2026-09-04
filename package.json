@@ -16,7 +16,7 @@
     "tv": "node src/cli/index.js",
     "test": "npm run test:unit",
     "test:e2e": "node --test tests/e2e.test.js",
-    "test:unit": "node --test tests/bar_snapshot.test.js tests/chart.test.js tests/cli.test.js tests/pine_analyze.test.js tests/plot_list.test.js tests/replay-capture-chunk.test.js tests/replay.test.js tests/sanitization.test.js",
+    "test:unit": "node --test tests/bar_snapshot.test.js tests/chart.test.js tests/hover_bar.test.js tests/cli.test.js tests/pine_analyze.test.js tests/plot_list.test.js tests/replay-capture-chunk.test.js tests/replay.test.js tests/sanitization.test.js",
     "test:cli": "node --test tests/cli.test.js",
     "test:all": "npm run test:unit && npm run test:e2e",
     "test:verbose": "npm run test:unit -- --test-reporter=spec",

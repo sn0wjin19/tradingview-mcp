@@ -12,6 +12,7 @@ export * as replay from './replay.js';
 export * as liveCapture0822 from './live_capture_0822.js';
 export * as plotList from './plot_list.js';
 export * as barSnapshot from './bar_snapshot.js';
+export * as hoverBar from './hover_bar.js';
 export * as alerts from './alerts.js';
 export * as batch from './batch.js';
 export * as watchlist from './watchlist.js';

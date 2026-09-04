@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/chart.js';
+import { hoverBar, MAX_HOVER_BAR_OFFSET } from '../core/hover_bar.js';
 
 export function registerChartTools(server) {
   server.tool('chart_get_state', 'Get current chart state (symbol, timeframe, chart type, indicators)', {}, async () => {
@@ -57,6 +58,29 @@ export function registerChartTools(server) {
   }, async ({ date }) => {
     try { return jsonResult(await core.scrollToDate({ date })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('chart_hover_bar', 'Move the active-pane crosshair to one exact loaded bar and return a stable Data Window reading. This is a verification fallback: it only sends CDP mouseMoved, verifies TradingView applied the requested bar time, and fails closed if Replay is active, the bar is not visible, or identities change.', {
+    time: z.coerce.number().optional().describe('Unix bar time in seconds or milliseconds. Exactly one of time or bars_ago is required.'),
+    bars_ago: z.coerce.number().int().min(0).max(MAX_HOVER_BAR_OFFSET).optional().describe('Offset from the last loaded bar. Exactly one of time or bars_ago is required; 0 selects the active bar.'),
+    study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for target visible studies. Each filter must match a study; omit to read every visible study Data Window.'),
+    stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Consecutive identical Data Window observations required before success (default 2).'),
+    poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between Data Window stability observations (default 100).'),
+    timeout_ms: z.coerce.number().int().min(100).max(10000).optional().describe('Bounded timeout for revealing the bar and settling the crosshair/Data Window (default 2000).'),
+  }, async ({ time, bars_ago, study_filters, stable_polls, poll_interval_ms, timeout_ms }) => {
+    try {
+      const result = await hoverBar({
+        time,
+        bars_ago,
+        study_filters,
+        stable_polls,
+        poll_interval_ms,
+        timeout_ms,
+      });
+      return jsonResult(result, result.success !== true);
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
   });
 
   server.tool('symbol_info', 'Get detailed metadata about the current symbol (name, exchange, type, description)', {}, async () => {

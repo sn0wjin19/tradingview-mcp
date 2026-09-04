@@ -22,7 +22,7 @@ const server = new McpServer(
     description: 'AI-assisted TradingView chart analysis and Pine Script development via Chrome DevTools Protocol',
   },
   {
-    instructions: `TradingView MCP — 78 tools for reading and controlling a live TradingView Desktop chart.
+    instructions: `TradingView MCP — 83 tools for reading and controlling a live TradingView Desktop chart.
 
 TOOL SELECTION GUIDE — use this to pick the right tool:
 
@@ -31,6 +31,8 @@ Reading your chart:
 - data_get_study_values → get current numeric values from ALL visible indicators (RSI, MACD, BB, EMA, etc.)
 - quote_get → get real-time price snapshot (last, OHLC, volume)
 - data_get_ohlcv → get price bars. ALWAYS pass summary=true unless you need individual bars
+- data_get_bar_snapshot / data_scan_panes → use atomic PlotList snapshots for stable closed bars; prefer these for historical reads
+- chart_hover_bar → verification fallback when a Data Window value is needed at one exact loaded bar; it moves only the crosshair and fails closed unless the applied bar time is proven
 
 Reading custom Pine indicator output (line.new/label.new/table.new/box.new drawings):
 - data_get_pine_lines → horizontal price levels from custom indicators (deduplicated, sorted)
@@ -44,6 +46,7 @@ Changing the chart:
 - chart_set_symbol, chart_set_timeframe, chart_set_type → change ticker/resolution/style
 - chart_manage_indicator → add/remove studies. USE FULL NAMES: "Relative Strength Index" not "RSI"
 - chart_scroll_to_date → jump to a date (ISO format)
+- chart_hover_bar → move crosshair to one exact loaded bar and read stable Data Window values
 - indicator_set_inputs → change indicator settings (length, source, etc.)
 
 Pine Script development:
