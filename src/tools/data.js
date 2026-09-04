@@ -77,7 +77,11 @@ export function registerDataTools(server) {
   });
 
   server.tool('data_scan_panes', 'Atomically read closed-bar PlotList snapshots from every pane in the current layout. The whole layout must remain complete, ordered, identity-stable, and identical for consecutive polls.', {
-    after_time_by_pane: z.array(z.union([z.null(), z.coerce.number()])).min(1).max(16).optional().describe('Per-pane forward cursors. A timestamp must exactly match a loaded closed bar; null bootstraps only that pane from its latest closed tail.'),
+    after_time_by_pane: z.array(z.union([
+      z.null(),
+      z.number(),
+      z.string().trim().min(1),
+    ])).min(1).max(16).optional().describe('Per-pane forward cursors. A timestamp must exactly match a loaded closed bar; null bootstraps only that pane from its latest closed tail.'),
     count: z.coerce.number().int().min(1).max(MAX_BAR_SNAPSHOT_COUNT).optional().describe('Bars per pane, newest last (default 1, max 20).'),
     closed_only: z.boolean().optional().describe('Exclude each pane active bar (default true).'),
     study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for study names. Every pane must contain every requested visible PlotList study.'),

@@ -709,7 +709,9 @@ describe('data_scan_panes', () => {
     assert.deepEqual(Object.keys(scan.schema).sort(), [
       'after_time_by_pane', 'closed_only', 'count', 'poll_interval_ms', 'stable_polls', 'study_filters',
     ]);
-    assert.equal(scan.schema.after_time_by_pane.safeParse([90]).success, true);
+    assert.equal(scan.schema.after_time_by_pane.safeParse([90, null, '100']).success, true);
+    assert.equal(scan.schema.after_time_by_pane.safeParse([true]).success, false);
+    assert.equal(scan.schema.after_time_by_pane.safeParse(['']).success, false);
     assert.equal(scan.schema.after_time_by_pane.safeParse([]).success, false);
     assert.equal(scan.schema.count.safeParse(1).success, true);
     assert.equal(scan.schema.count.safeParse(20).success, true);
