@@ -78,6 +78,13 @@ function asIndexable(value) {
   return value;
 }
 
+function plainObject(value) {
+  const indexed = asIndexable(value);
+  const out = {};
+  for (const key of Object.keys(indexed).sort()) out[key] = indexed[key];
+  return out;
+}
+
 function lookupIndexed(collection, index) {
   if (collection == null) return undefined;
   if (Array.isArray(collection)) return collection[index];
@@ -142,7 +149,7 @@ export function resolvePaletteColor(meta, paletteId, rawValue) {
 
 export function plotManifest(plot, styles, index) {
   const spec = plot && typeof plot === 'object' ? plot : {};
-  const styleMap = styles && typeof styles === 'object' ? styles : {};
+  const styleMap = asIndexable(styles);
   const style = spec.id != null && styleMap[spec.id] && typeof styleMap[spec.id] === 'object'
     ? styleMap[spec.id]
     : {};
@@ -253,10 +260,49 @@ export function hydrateStudyFromPlotList(study) {
   const row = Array.isArray(study && study.row) ? study.row : [];
   const plots = mapPlotListRow(meta, row);
   const fills = parseFilledAreas(meta, row, plots);
+  const rawFills = Array.isArray(meta.filledAreas)
+    ? meta.filledAreas
+    : (Array.isArray(meta.filled_areas) ? meta.filled_areas : []);
+  const paletteDefinitions = plainObject(meta.palettes);
+  const paletteDefaults = plainObject(meta.defaults && meta.defaults.palettes);
+  const paletteIds = [...new Set([
+    ...Object.keys(paletteDefinitions),
+    ...Object.keys(paletteDefaults),
+  ])].sort();
+  const palettes = {};
+  for (const id of paletteIds) {
+    const definition = paletteDefinitions[id] && typeof paletteDefinitions[id] === 'object'
+      ? paletteDefinitions[id]
+      : {};
+    const defaults = paletteDefaults[id] && typeof paletteDefaults[id] === 'object'
+      ? paletteDefaults[id]
+      : {};
+    palettes[id] = {
+      valToIndex: plainObject(definition.valToIndex),
+      colors: plainObject(defaults.colors != null ? defaults.colors : definition.colors),
+    };
+  }
+  const historyCalculationMayChange = study
+    && typeof study.history_calculation_may_change === 'boolean'
+    ? study.history_calculation_may_change
+    : !!meta.historyCalculationMayChange;
   return {
     entity_id: study && study.entity_id != null ? study.entity_id : null,
     name: study && study.name != null ? study.name : null,
-    history_calculation_may_change: !!(study && study.history_calculation_may_change),
+    history_calculation_may_change: historyCalculationMayChange,
+    manifest: {
+      plots: (Array.isArray(meta.plots) ? meta.plots : [])
+        .map((plot, index) => plotManifest(plot, meta.styles, index)),
+      fills: rawFills.map(fill => ({
+        id: fill && fill.id != null ? String(fill.id) : null,
+        title: fill && fill.title != null ? String(fill.title) : null,
+        objAId: fill && fill.objAId != null ? String(fill.objAId) : null,
+        objBId: fill && fill.objBId != null ? String(fill.objBId) : null,
+        palette: fill && fill.palette != null ? String(fill.palette) : null,
+      })),
+      palettes,
+      history_calculation_may_change: historyCalculationMayChange,
+    },
     plots,
     fills,
   };

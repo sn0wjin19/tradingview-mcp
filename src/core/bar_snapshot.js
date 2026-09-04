@@ -85,6 +85,29 @@ export function parseBarSnapshotOptions({
   };
 }
 
+export function parsePaneScanOptions({
+  count,
+  closed_only,
+  study_filters,
+  stable_polls,
+  poll_interval_ms,
+} = {}) {
+  const stablePolls = asInteger(stable_polls, DEFAULT_STABLE_POLLS, 2, 12, 'stable_polls');
+  return {
+    time: null,
+    bars_ago: null,
+    count: asInteger(count, DEFAULT_COUNT, 1, MAX_BAR_SNAPSHOT_COUNT, 'count'),
+    closed_only: asBoolean(closed_only, true, 'closed_only'),
+    study_filters: asStudyFilters(study_filters),
+    stable_polls: stablePolls,
+    poll_interval_ms: asInteger(
+      poll_interval_ms, DEFAULT_POLL_INTERVAL_MS, 25, 2000, 'poll_interval_ms'
+    ),
+    poll_attempts: Math.max(DEFAULT_POLL_ATTEMPTS, stablePolls),
+    scan_panes: true,
+  };
+}
+
 function failClosed(code, message, extra = {}) {
   return {
     success: false,
@@ -106,6 +129,7 @@ export function buildBarSnapshotExpression(options) {
     stablePolls: options.stable_polls,
     pollIntervalMs: options.poll_interval_ms,
     pollAttempts: options.poll_attempts,
+    scanPanes: options.scan_panes === true,
   });
   return `
     (async function() {
@@ -146,10 +170,29 @@ export function buildBarSnapshotExpression(options) {
         try { return window.TradingViewApi._activeChartWidgetWV.value(); }
         catch (error) { return null; }
       }
+      function replayActive() {
+        try {
+          var replay = window.TradingViewApi._replayApi;
+          if (!replay || typeof replay.isReplayStarted !== 'function') return null;
+          var started = replay.isReplayStarted();
+          if (started && typeof started === 'object' && typeof started.value === 'function') {
+            started = started.value();
+          }
+          return started === true;
+        } catch (error) {
+          return null;
+        }
+      }
       function chartIdentity(chart) {
         try {
-          var symbol = typeof chart.symbol === 'function' ? chart.symbol() : null;
-          var timeframe = typeof chart.resolution === 'function' ? chart.resolution() : null;
+          var activeWrapper = chart && chart._chartWidget ? chart : null;
+          var widget = activeWrapper ? chart._chartWidget : chart;
+          var model = widget && typeof widget.model === 'function' ? widget.model() : null;
+          var mainSeries = model && typeof model.mainSeries === 'function' ? model.mainSeries() : null;
+          var symbol = activeWrapper && typeof chart.symbol === 'function' ? chart.symbol()
+            : (mainSeries && typeof mainSeries.symbol === 'function' ? mainSeries.symbol() : null);
+          var timeframe = activeWrapper && typeof chart.resolution === 'function' ? chart.resolution()
+            : (mainSeries && typeof mainSeries.interval === 'function' ? mainSeries.interval() : null);
           if (typeof symbol !== 'string' || symbol.trim() === ''
               || typeof timeframe !== 'string' || timeframe.trim() === '') return null;
           return { symbol: symbol, timeframe: timeframe };
@@ -158,11 +201,17 @@ export function buildBarSnapshotExpression(options) {
         }
       }
       function mainSeriesBars(chart) {
-        try { return chart._chartWidget.model().mainSeries().bars(); }
+        try {
+          var widget = chart._chartWidget || chart;
+          return widget.model().mainSeries().bars();
+        }
         catch (error) { return null; }
       }
       function chartSources(chart) {
-        try { return chart._chartWidget.model().model().dataSources(); }
+        try {
+          var widget = chart._chartWidget || chart;
+          return widget.model().model().dataSources();
+        }
         catch (error) { return null; }
       }
       function safeStudyName(source) {
@@ -472,6 +521,11 @@ export function buildBarSnapshotExpression(options) {
         return { studiesByBar: studiesByBar };
       }
       function fingerprint(snapshot) {
+        if (snapshot && Array.isArray(snapshot.panes)) {
+          return JSON.stringify(snapshot.panes.map(function(pane) {
+            return JSON.parse(fingerprint(pane));
+          }));
+        }
         return JSON.stringify({
           symbol: snapshot.symbol,
           timeframe: snapshot.timeframe,
@@ -494,15 +548,25 @@ export function buildBarSnapshotExpression(options) {
           })
         });
       }
-      function observe() {
-        var chart = chartWidget();
-        if (!chart) return fail('chart_unavailable', 'Active chart widget is unavailable');
+      function observe(chart, paneIndex) {
+        chart = chart || chartWidget();
+        if (!chart) return fail('chart_unavailable', 'Chart widget is unavailable', {
+          pane_index: paneIndex
+        });
         var identity = chartIdentity(chart);
-        if (!identity) return fail('identity_unavailable', 'Chart symbol/timeframe identity is unavailable');
+        if (!identity) return fail('identity_unavailable', 'Chart symbol/timeframe identity is unavailable', {
+          pane_index: paneIndex
+        });
         var located = locateBars(mainSeriesBars(chart));
-        if (located.error) return located.error;
+        if (located.error) {
+          if (located.error.failure && paneIndex != null) located.error.failure.pane_index = paneIndex;
+          return located.error;
+        }
         var studies = readStudies(chart, chartSources(chart), located.records);
-        if (studies.error) return studies.error;
+        if (studies.error) {
+          if (studies.error.failure && paneIndex != null) studies.error.failure.pane_index = paneIndex;
+          return studies.error;
+        }
         var records = [];
         for (var i = 0; i < located.records.length; i += 1) {
           var bar = located.records[i];
@@ -516,6 +580,7 @@ export function buildBarSnapshotExpression(options) {
         return {
           success: true,
           capture_mode: 'plot_list',
+          pane_index: paneIndex,
           symbol: identity.symbol,
           timeframe: identity.timeframe,
           active_bar_time: located.activeTime,
@@ -523,22 +588,113 @@ export function buildBarSnapshotExpression(options) {
         };
       }
 
+      var previousChartOrder = null;
+      function observeLayout() {
+        var collection;
+        var charts;
+        try {
+          collection = window.TradingViewApi._chartWidgetCollection;
+          charts = collection.getAll();
+        } catch (error) {
+          return fail('layout_unavailable', 'Chart widget collection is unavailable');
+        }
+        if (!Array.isArray(charts) || charts.length === 0) {
+          return previousChartOrder
+            ? fail('layout_changed', 'Pane count changed before the layout snapshot was stable', {
+                previous_pane_count: previousChartOrder.length,
+                current_pane_count: Array.isArray(charts) ? charts.length : null
+              })
+            : fail('layout_unavailable', 'Current layout has no readable panes');
+        }
+        if (previousChartOrder) {
+          if (previousChartOrder.length !== charts.length) {
+            return fail('layout_changed', 'Pane count changed before the layout snapshot was stable', {
+              previous_pane_count: previousChartOrder.length,
+              current_pane_count: charts.length
+            });
+          }
+          for (var orderIndex = 0; orderIndex < charts.length; orderIndex += 1) {
+            if (previousChartOrder[orderIndex] !== charts[orderIndex]) {
+              return fail('layout_changed', 'Pane order changed before the layout snapshot was stable', {
+                pane_index: orderIndex
+              });
+            }
+          }
+        } else {
+          previousChartOrder = charts.slice();
+        }
+        var panes = [];
+        for (var paneIndex = 0; paneIndex < charts.length; paneIndex += 1) {
+          var pane = observe(charts[paneIndex], paneIndex);
+          if (!pane || pane.success !== true) return pane;
+          panes.push(pane);
+        }
+        return {
+          success: true,
+          capture_mode: 'plot_list',
+          pane_count: panes.length,
+          panes: panes
+        };
+      }
+
+      function snapshotIdentity(snapshot) {
+        if (opt.scanPanes) {
+          return snapshot.panes.map(function(pane) {
+            return { symbol: pane.symbol, timeframe: pane.timeframe };
+          });
+        }
+        return { symbol: snapshot.symbol, timeframe: snapshot.timeframe };
+      }
+
+      function identityFailure(previous, current) {
+        if (!opt.scanPanes) {
+          if (previous.symbol === current.symbol && previous.timeframe === current.timeframe) return null;
+          return fail('identity_mismatch', 'Chart symbol/timeframe changed before the snapshot was stable', {
+            previous: previous,
+            current: current
+          });
+        }
+        if (previous.length !== current.length) {
+          return fail('layout_changed', 'Pane count changed before the layout snapshot was stable', {
+            previous_pane_count: previous.length,
+            current_pane_count: current.length
+          });
+        }
+        for (var paneIndex = 0; paneIndex < current.length; paneIndex += 1) {
+          var before = previous[paneIndex];
+          var after = current[paneIndex];
+          if (before.symbol !== after.symbol || before.timeframe !== after.timeframe) {
+            var beforeKeys = previous.map(function(item) { return item.symbol + '\\u0000' + item.timeframe; }).sort();
+            var afterKeys = current.map(function(item) { return item.symbol + '\\u0000' + item.timeframe; }).sort();
+            var reordered = JSON.stringify(beforeKeys) === JSON.stringify(afterKeys);
+            return fail(reordered ? 'layout_changed' : 'identity_mismatch',
+              reordered ? 'Pane order changed before the layout snapshot was stable'
+                : 'Pane symbol/timeframe changed before the layout snapshot was stable', {
+                pane_index: paneIndex,
+                previous: before,
+                current: after
+              });
+          }
+        }
+        return null;
+      }
+
       var stable = 0;
       var previousFingerprint = null;
       var previousIdentity = null;
       var lastComplete = null;
       for (var attempt = 0; attempt < opt.pollAttempts; attempt += 1) {
-        var snapshot = observe();
+        var replayStarted = replayActive();
+        var snapshot = replayStarted === null
+          ? fail('replay_state_unavailable', 'Replay state is unavailable')
+          : (replayStarted
+              ? fail('replay_active', 'Forward-only PlotList snapshots are unavailable while Replay is active')
+              : (opt.scanPanes ? observeLayout() : observe()));
         if (!snapshot || snapshot.success !== true) {
           if (snapshot && snapshot.failure && (
-            snapshot.failure.code === 'identity_unavailable'
-            || snapshot.failure.code === 'no_matching_study'
-            || snapshot.failure.code === 'bar_not_found'
-            || snapshot.failure.code === 'active_bar_excluded'
-            || snapshot.failure.code === 'main_series_unavailable'
-            || snapshot.failure.code === 'chart_unavailable'
-            || snapshot.failure.code === 'study_identity_unavailable'
-            || snapshot.failure.code === 'study_identity_duplicate'
+            snapshot.failure.code === 'active_bar_excluded'
+            || snapshot.failure.code === 'replay_active'
+            || snapshot.failure.code === 'replay_state_unavailable'
           )) {
             return snapshot;
           }
@@ -546,14 +702,12 @@ export function buildBarSnapshotExpression(options) {
           previousFingerprint = null;
           lastComplete = snapshot;
         } else {
-          if (previousIdentity
-              && (previousIdentity.symbol !== snapshot.symbol || previousIdentity.timeframe !== snapshot.timeframe)) {
-            return fail('identity_mismatch', 'Chart symbol/timeframe changed before the snapshot was stable', {
-              previous: previousIdentity,
-              current: { symbol: snapshot.symbol, timeframe: snapshot.timeframe }
-            });
+          var currentIdentity = snapshotIdentity(snapshot);
+          if (previousIdentity) {
+            var changed = identityFailure(previousIdentity, currentIdentity);
+            if (changed) return changed;
           }
-          previousIdentity = { symbol: snapshot.symbol, timeframe: snapshot.timeframe };
+          previousIdentity = currentIdentity;
           var mark = fingerprint(snapshot);
           if (mark === previousFingerprint) stable += 1;
           else {
@@ -564,6 +718,12 @@ export function buildBarSnapshotExpression(options) {
           if (stable >= opt.stablePolls) {
             lastComplete.stable_polls = stable;
             lastComplete.identity_verified = true;
+            if (opt.scanPanes) {
+              for (var paneIndex = 0; paneIndex < lastComplete.panes.length; paneIndex += 1) {
+                lastComplete.panes[paneIndex].stable_polls = stable;
+                lastComplete.panes[paneIndex].identity_verified = true;
+              }
+            }
             return lastComplete;
           }
         }
@@ -576,6 +736,10 @@ export function buildBarSnapshotExpression(options) {
       });
     })()
   `;
+}
+
+export function buildPaneScanExpression(options) {
+  return buildBarSnapshotExpression({ ...options, scan_panes: true });
 }
 
 export function hydrateBarSnapshot(raw) {
@@ -678,4 +842,53 @@ export async function getBarSnapshot(options = {}) {
   const { evaluateAsync } = resolve(options._deps);
   const raw = await evaluateAsync(buildBarSnapshotExpression(parsed));
   return hydrateBarSnapshot(validateBarSnapshotResult(raw, parsed));
+}
+
+export function hydratePaneScan(raw) {
+  if (!raw || raw.success !== true || !Array.isArray(raw.panes)) return raw;
+  return {
+    ...raw,
+    panes: raw.panes.map(pane => ({
+      ...hydrateBarSnapshot(pane),
+      pane_index: pane.pane_index,
+    })),
+  };
+}
+
+export function validatePaneScanResult(raw, options) {
+  if (!raw || typeof raw !== 'object' || raw.success !== true) {
+    const failed = validateBarSnapshotResult(raw, options);
+    return { ...failed, pane_count: 0, panes: [] };
+  }
+  if (!Number.isInteger(raw.pane_count) || raw.pane_count < 1
+      || !Array.isArray(raw.panes) || raw.panes.length !== raw.pane_count) {
+    return { ...failClosed('invalid_response', 'page response has an invalid pane layout'), pane_count: 0, panes: [] };
+  }
+  for (let paneIndex = 0; paneIndex < raw.panes.length; paneIndex += 1) {
+    const pane = raw.panes[paneIndex];
+    if (!pane || pane.pane_index !== paneIndex) {
+      return { ...failClosed('layout_changed', 'page response has an invalid pane order', { pane_index: paneIndex }), pane_count: 0, panes: [] };
+    }
+    const validated = validateBarSnapshotResult({
+      ...pane,
+      identity_verified: raw.identity_verified,
+      stable_polls: raw.stable_polls,
+    }, options);
+    if (validated.success !== true) {
+      return {
+        ...validated,
+        failure: { ...validated.failure, pane_index: paneIndex },
+        pane_count: raw.pane_count,
+        panes: [],
+      };
+    }
+  }
+  return raw;
+}
+
+export async function scanPanes(options = {}) {
+  const parsed = parsePaneScanOptions(options);
+  const { evaluateAsync } = resolve(options._deps);
+  const raw = await evaluateAsync(buildPaneScanExpression(parsed));
+  return hydratePaneScan(validatePaneScanResult(raw, parsed));
 }

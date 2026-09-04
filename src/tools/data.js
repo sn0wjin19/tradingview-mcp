@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 import * as live0822 from '../core/live_capture_0822.js';
-import { getBarSnapshot, MAX_BAR_SNAPSHOT_COUNT } from '../core/bar_snapshot.js';
+import { getBarSnapshot, MAX_BAR_SNAPSHOT_COUNT, scanPanes } from '../core/bar_snapshot.js';
 
 export function registerDataTools(server) {
   server.tool('data_capture_0822_closed', 'Atomically capture 1–5 confirmed 0822 closed bars from the live chart without entering or advancing Replay. The newest target is the bar immediately before the active bar and is the only row allowed to emit strategy-eligible checkpoint deltas; older tail rows are finalized PlotList features only and explicitly non-causal for events. The tool requires at least two identical full observations and returns symbol/timeframe from that same page evaluation.', {
@@ -64,6 +64,27 @@ export function registerDataTools(server) {
       const result = await getBarSnapshot({
         time,
         bars_ago,
+        count,
+        closed_only,
+        study_filters,
+        stable_polls,
+        poll_interval_ms,
+      });
+      return jsonResult(result, result.success !== true);
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
+  });
+
+  server.tool('data_scan_panes', 'Atomically read closed-bar PlotList snapshots from every pane in the current layout. The whole layout must remain complete, ordered, identity-stable, and identical for consecutive polls.', {
+    count: z.coerce.number().int().min(1).max(MAX_BAR_SNAPSHOT_COUNT).optional().describe('Bars per pane, newest last (default 1, max 20).'),
+    closed_only: z.boolean().optional().describe('Exclude each pane active bar (default true).'),
+    study_filters: z.array(z.string().min(1)).optional().describe('Substring filters for study names. Every pane must contain every requested visible PlotList study.'),
+    stable_polls: z.coerce.number().int().min(2).max(12).optional().describe('Identical complete whole-layout snapshots required before success (default 2).'),
+    poll_interval_ms: z.coerce.number().int().min(25).max(2000).optional().describe('Milliseconds between whole-layout observations (default 100).'),
+  }, async ({ count, closed_only, study_filters, stable_polls, poll_interval_ms }) => {
+    try {
+      const result = await scanPanes({
         count,
         closed_only,
         study_filters,

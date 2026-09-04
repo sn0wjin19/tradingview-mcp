@@ -71,6 +71,10 @@ describe('plot_list palette', () => {
     meta.defaults.palettes = new Map(Object.entries(meta.defaults.palettes));
     assert.equal(resolvePaletteColor(meta, 'palette_block', 1).hex, SWING_PALETTE_COLORS[1]);
     assert.equal(mapPlotListRow(meta, swingPaletteRow(100))[0].title, '背离线');
+    assert.equal(
+      hydrateStudyFromPlotList({ meta, row: swingPaletteRow(100) }).manifest.plots[0].title,
+      '背离线',
+    );
   });
 });
 
@@ -113,6 +117,15 @@ describe('plot_list row mapping', () => {
     assert.equal(plots[4].type, 'colorer');
     assert.equal(plots[4].target, 'fill_z1');
     assert.equal(plots[4].color.hex, TREND_COLORS.GREEN.hex);
+    const hydrated = hydrateStudyFromPlotList({ meta: trendFillMeta, row });
+    assert.deepEqual(hydrated.manifest.fills[0], {
+      id: 'fill_z1',
+      title: 'Z1',
+      objAId: 'plot_z1_upper',
+      objBId: 'plot_z1_lower',
+      palette: null,
+    });
+    assert.equal(hydrated.manifest.history_calculation_may_change, true);
   });
 
   it('hydrates a study without dropping empty cells', () => {
@@ -127,5 +140,16 @@ describe('plot_list row mapping', () => {
     assert.equal(study.plots[3].value, null);
     assert.equal(study.history_calculation_may_change, true);
     assert.equal(study.fills.length, 0);
+    assert.deepEqual(Object.keys(study.manifest), [
+      'plots', 'fills', 'palettes', 'history_calculation_may_change',
+    ]);
+    assert.equal(study.manifest.plots[0].row_index, 1);
+    assert.deepEqual(Object.keys(study.manifest.plots[0]), [
+      'id', 'type', 'target', 'palette', 'title', 'text', 'row_index',
+    ]);
+    assert.equal(study.manifest.history_calculation_may_change, true);
+    assert.deepEqual(study.manifest.palettes.palette_block.valToIndex, {
+      0: 0, 1: 1, 2: 2, 3: 3, 4: 4,
+    });
   });
 });

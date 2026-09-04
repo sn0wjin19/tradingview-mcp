@@ -8,6 +8,7 @@ import {
   buildBarSnapshotExpression,
   getBarSnapshot,
   parseBarSnapshotOptions,
+  scanPanes,
 } from '../src/core/bar_snapshot.js';
 import { registerDataTools } from '../src/tools/data.js';
 import {
@@ -102,6 +103,7 @@ function makeRuntime({
     },
     pageWindow: {
       TradingViewApi: {
+        _replayApi: { isReplayStarted: () => false },
         _activeChartWidgetWV: {
           value: () => ({
             symbol: () => currentSymbol(),
@@ -112,7 +114,11 @@ function makeRuntime({
             })),
             _chartWidget: {
               model: () => ({
-                mainSeries: () => ({ bars: () => barsApi(bars) }),
+                mainSeries: () => ({
+                  symbol: () => currentSymbol(),
+                  interval: () => timeframe,
+                  bars: () => barsApi(bars),
+                }),
                 model: () => ({ dataSources: () => studySources }),
               }),
             },
@@ -138,6 +144,32 @@ function depsFor(runtime) {
   };
 }
 
+function makePaneRuntime(paneOptions, { layoutSequence } = {}) {
+  const runtimes = paneOptions.map(options => makeRuntime(options));
+  const paneCharts = runtimes.map(runtime => (
+    runtime.pageWindow.TradingViewApi._activeChartWidgetWV.value()._chartWidget
+  ));
+  let layoutIndex = 0;
+  const defaultLayout = runtimes.map((runtime, index) => index);
+  const sequence = layoutSequence || [defaultLayout];
+  const runtime = {
+    onSleep(delay) {
+      for (const paneRuntime of runtimes) paneRuntime.onSleep(delay);
+      if (layoutIndex < sequence.length - 1) layoutIndex += 1;
+    },
+    pageWindow: {
+      TradingViewApi: {
+        _replayApi: { isReplayStarted: () => false },
+        _chartWidgetCollection: {
+          getAll: () => sequence[Math.min(layoutIndex, sequence.length - 1)]
+            .map(index => paneCharts[index]),
+        },
+      },
+    },
+  };
+  return runtime;
+}
+
 describe('data_get_bar_snapshot options', () => {
   it('rejects time+bars_ago and closed_only bars_ago=0 before any page evaluation', async () => {
     assert.throws(() => parseBarSnapshotOptions({ time: 100, bars_ago: 1 }), /mutually exclusive/);
@@ -152,6 +184,18 @@ describe('data_get_bar_snapshot options', () => {
 });
 
 describe('data_get_bar_snapshot page capture', () => {
+  it('fails closed while Replay is active', async () => {
+    const runtime = makeRuntime();
+    runtime.pageWindow.TradingViewApi._replayApi.isReplayStarted = () => true;
+    const result = await getBarSnapshot({
+      poll_interval_ms: 25,
+      _deps: depsFor(runtime),
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.equal(result.failure.code, 'replay_active');
+    assert.deepEqual(result.records, []);
+  });
+
   it('defaults to the latest closed bar and excludes the active bar', async () => {
     const result = await getBarSnapshot({
       study_filters: ['趋势过滤器', '波段过滤器'],
@@ -432,8 +476,129 @@ describe('data_get_bar_snapshot tool registration', () => {
     assert.ok(snapshot.schema.time);
     assert.ok(snapshot.schema.bars_ago);
     assert.ok(snapshot.schema.study_filters);
-    assert.equal(tools.some(tool => tool.name === 'data_scan_panes'), false);
+    assert.equal(tools.some(tool => tool.name === 'data_scan_panes'), true);
     assert.equal(tools.some(tool => tool.name === 'chart_hover_bar'), false);
+  });
+});
+
+describe('data_scan_panes', () => {
+  it('captures three panes in one page evaluation after whole-layout stability', async () => {
+    const runtime = makePaneRuntime([
+      { symbol: 'BYBIT:BTCUSDT.P', timeframe: '15' },
+      { symbol: 'BYBIT:BTCUSDT.P', timeframe: '60' },
+      { symbol: 'BYBIT:BTCUSDT.P', timeframe: '240' },
+    ]);
+    let evaluations = 0;
+    const result = await scanPanes({
+      count: 2,
+      study_filters: ['趋势过滤器', '波段过滤器'],
+      stable_polls: 2,
+      poll_interval_ms: 25,
+      _deps: {
+        evaluateAsync: expression => {
+          evaluations += 1;
+          assert.match(expression, /_chartWidgetCollection/);
+          assert.match(expression, /\.getAll\(\)/);
+          return runPageExpression(runtime, expression);
+        },
+      },
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(evaluations, 1);
+    assert.equal(result.pane_count, 3);
+    assert.equal(result.stable_polls, 2);
+    assert.deepEqual(result.panes.map(pane => [pane.pane_index, pane.symbol, pane.timeframe]), [
+      [0, 'BYBIT:BTCUSDT.P', '15'],
+      [1, 'BYBIT:BTCUSDT.P', '60'],
+      [2, 'BYBIT:BTCUSDT.P', '240'],
+    ]);
+    assert.ok(result.panes.every(pane => pane.identity_verified === true));
+    assert.ok(result.panes.every(pane => pane.active_bar_time === 110));
+    assert.ok(result.panes.every(pane => pane.records.length === 2));
+    assert.ok(result.panes.every(pane => pane.records[0].studies[0].manifest));
+  });
+
+  it('fails the whole scan with pane_index when a pane is missing a requested study', async () => {
+    const result = await scanPanes({
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([
+        {},
+        { studies: [] },
+        {},
+      ])),
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.equal(result.failure.code, 'no_matching_study');
+    assert.equal(result.failure.pane_index, 1);
+    assert.deepEqual(result.panes, []);
+  });
+
+  it('fails closed with pane_index when one pane identity flutters', async () => {
+    const result = await scanPanes({
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([
+        {},
+        { symbolSequence: ['BYBIT:BTCUSDT.P', 'BYBIT:ETHUSDT.P'] },
+        {},
+      ])),
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.equal(result.failure.code, 'identity_mismatch');
+    assert.equal(result.failure.pane_index, 1);
+    assert.deepEqual(result.panes, []);
+  });
+
+  it('retries a transient unavailable pane identity before requiring stability', async () => {
+    const result = await scanPanes({
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([
+        {},
+        { symbolSequence: ['', 'BYBIT:BTCUSDT.P', 'BYBIT:BTCUSDT.P'] },
+        {},
+      ])),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(result.panes[1].symbol, 'BYBIT:BTCUSDT.P');
+    assert.equal(result.stable_polls, 2);
+  });
+
+  it('fails closed when pane count or order changes during stability polling', async () => {
+    const changedCount = await scanPanes({
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{}, {}, {}], {
+        layoutSequence: [[0, 1, 2], [0, 1]],
+      })),
+    });
+    assert.equal(changedCount.success, false, JSON.stringify(changedCount));
+    assert.equal(changedCount.failure.code, 'layout_changed');
+
+    const changedOrder = await scanPanes({
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([
+        { symbol: 'BYBIT:BTCUSDT.P' },
+        { symbol: 'BYBIT:ETHUSDT.P' },
+      ], { layoutSequence: [[0, 1], [1, 0]] })),
+    });
+    assert.equal(changedOrder.success, false, JSON.stringify(changedOrder));
+    assert.equal(changedOrder.failure.code, 'layout_changed');
+    assert.equal(changedOrder.failure.pane_index, 0);
+  });
+
+  it('registers the bounded pane scan schema', () => {
+    const tools = [];
+    registerDataTools({ tool(name, description, schema) { tools.push({ name, description, schema }); } });
+    const scan = tools.find(tool => tool.name === 'data_scan_panes');
+    assert.ok(scan);
+    assert.deepEqual(Object.keys(scan.schema).sort(), [
+      'closed_only', 'count', 'poll_interval_ms', 'stable_polls', 'study_filters',
+    ]);
+    assert.equal(scan.schema.count.safeParse(1).success, true);
+    assert.equal(scan.schema.count.safeParse(20).success, true);
+    assert.equal(scan.schema.count.safeParse(21).success, false);
+    assert.equal(scan.schema.stable_polls.safeParse(1).success, false);
   });
 });
 
