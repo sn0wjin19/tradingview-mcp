@@ -57,7 +57,8 @@ function asPaneCursorTimes(value) {
     throw new Error('after_time_by_pane must contain 1 to 16 unix timestamps');
   }
   return value.map((item, index) => {
-    if (item === null || typeof item === 'boolean' || (typeof item === 'string' && item.trim() === '')) {
+    if (item === null) return null;
+    if (typeof item === 'boolean' || (typeof item === 'string' && item.trim() === '')) {
       throw new Error(`after_time_by_pane[${index}] must be a finite unix timestamp`);
     }
     const parsed = asOptionalTime(item, `after_time_by_pane[${index}]`);
@@ -412,7 +413,8 @@ export function buildBarSnapshotExpression(options) {
         var cursorTime = null;
         var hasMore = false;
         var cursorStartIndex = null;
-        if (opt.afterTimes != null) {
+        var forwardPane = opt.afterTimes != null && opt.afterTimes[paneIndex] != null;
+        if (forwardPane) {
           cursorTime = comparableTime(opt.afterTimes[paneIndex]);
           var cursor = bars.searchByTime(cursorTime);
           if (!cursor || !cursor.value || !sameTime(cursor.value[0], cursorTime)
@@ -445,7 +447,7 @@ export function buildBarSnapshotExpression(options) {
         if (opt.closedOnly && endIndex >= last) {
           return { error: fail('active_bar_excluded', 'closed_only snapshots cannot return the active bar') };
         }
-        var startIndex = opt.afterTimes != null ? cursorStartIndex : endIndex - opt.count + 1;
+        var startIndex = forwardPane ? cursorStartIndex : endIndex - opt.count + 1;
         if (startIndex < first) {
           return { error: fail('insufficient_bars', 'The loaded main series has fewer bars than requested', {
             requested: opt.count,
@@ -478,7 +480,8 @@ export function buildBarSnapshotExpression(options) {
           activeTime: activeTime,
           records: records,
           cursorTime: cursorTime,
-          hasMore: hasMore
+          hasMore: hasMore,
+          forwardPane: forwardPane
         };
       }
       function readStudies(chart, sources, records) {
@@ -637,7 +640,7 @@ export function buildBarSnapshotExpression(options) {
           active_bar_time: located.activeTime,
           records: records
         };
-        if (opt.afterTimes != null) {
+        if (located.forwardPane) {
           result.cursor_time = located.cursorTime;
           result.has_more = located.hasMore;
         }
@@ -857,7 +860,9 @@ export function validateBarSnapshotResult(raw, options) {
   if (!Array.isArray(raw.records) || raw.records.length === 0) {
     return failClosed('bar_not_found', 'complete response has no records');
   }
-  const forwardPane = Array.isArray(options.after_time_by_pane) && Number.isInteger(raw.pane_index);
+  const forwardPane = Array.isArray(options.after_time_by_pane)
+    && Number.isInteger(raw.pane_index)
+    && options.after_time_by_pane[raw.pane_index] != null;
   if (!forwardPane && raw.records.length !== options.count) {
     return failClosed('insufficient_bars', 'complete response did not return the requested bar count', {
       requested: options.count,

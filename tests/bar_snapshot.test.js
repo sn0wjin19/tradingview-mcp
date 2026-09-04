@@ -573,6 +573,23 @@ describe('data_scan_panes', () => {
     assert.deepEqual(result.panes[0].records.map(record => record.bar_time), [100]);
   });
 
+  it('bootstraps only panes whose forward cursor is null', async () => {
+    const result = await scanPanes({
+      after_time_by_pane: [90, null, 100],
+      count: 1,
+      study_filters: ['趋势过滤器'],
+      poll_interval_ms: 25,
+      _deps: depsFor(makePaneRuntime([{}, {}, {}])),
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.deepEqual(result.panes.map(pane => pane.records.map(item => item.bar_time)), [
+      [90, 100], [100], [100],
+    ]);
+    assert.equal(result.panes[0].cursor_time, 90);
+    assert.equal('cursor_time' in result.panes[1], false);
+    assert.equal(result.panes[2].cursor_time, 100);
+  });
+
   it('fails the whole scan when any pane cursor is not exactly loaded', async () => {
     const result = await scanPanes({
       after_time_by_pane: [90, 95, 90],
@@ -600,7 +617,11 @@ describe('data_scan_panes', () => {
       after_time_by_pane: [1_788_480_000_000],
     });
     assert.deepEqual(parsed.after_time_by_pane, [1_788_480_000]);
-    assert.throws(() => parsePaneScanOptions({ after_time_by_pane: [null] }), /finite unix timestamp/);
+    assert.deepEqual(
+      parsePaneScanOptions({ after_time_by_pane: [null, 1_788_480_000_000] }).after_time_by_pane,
+      [null, 1_788_480_000],
+    );
+    assert.throws(() => parsePaneScanOptions({ after_time_by_pane: [true] }), /finite unix timestamp/);
     assert.throws(
       () => parsePaneScanOptions({ after_time_by_pane: [1_788_480_000_001] }),
       /whole-second/,
